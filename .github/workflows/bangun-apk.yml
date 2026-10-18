@@ -1,0 +1,127 @@
+# tanda-tangan-pribadi: v2
+name: Bangun APK Android
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: write
+
+jobs:
+  bangun:
+    name: Kompilasi APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ambil kode sumber
+        uses: actions/checkout@v4
+
+      - name: Periksa tanda tangan pribadi
+        id: tt
+        run: |
+          if [ -f .tanda-tangan/kunci.p12 ] && [ -f .tanda-tangan/sandi.properties ]; then
+            echo "pribadi=true" >> "$GITHUB_OUTPUT"
+            echo "Tanda tangan pribadi ditemukan: APK dibangun versi rilis."
+          else
+            echo "pribadi=false" >> "$GITHUB_OUTPUT"
+            echo "Memakai tanda tangan bawaan GitHub: APK dibangun versi debug."
+          fi
+
+      - name: Ekstrak ZIP proyek
+        run: for z in *.zip; do [ -f "$z" ] && unzip -o "$z"; done
+
+      - name: Pasang Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Siapkan Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ''
+
+      - name: Pasang platform Android
+        run: |
+          sdkmanager --install "platform-tools" "platforms;android-34" "platforms;android-35" "build-tools;34.0.0" "build-tools;35.0.0"
+          yes | sdkmanager --licenses >/dev/null || true
+
+      - name: Siapkan Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.3.1
+
+      - name: Kompilasi APK Android
+        env:
+          PRIBADI: ${{ steps.tt.outputs.pribadi }}
+        run: |
+          ROOT_DIR=$(find . -maxdepth 4 \( -name "settings.gradle" -o -name "settings.gradle.kts" \) ! -path "*/build/*" | head -n 1)
+          if [ -z "$ROOT_DIR" ]; then
+            ROOT_DIR=$(find . -maxdepth 4 \( -name "build.gradle" -o -name "build.gradle.kts" \) ! -path "*/build/*" ! -path "*/app/*" | head -n 1)
+          fi
+          if [ -z "$ROOT_DIR" ]; then
+            ROOT_DIR=$(find . -maxdepth 4 \( -name "build.gradle*" \) ! -path "*/build/*" | head -n 1)
+          fi
+          [ -n "$ROOT_DIR" ] && cd "$(dirname "$ROOT_DIR")"
+
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            RUN_GRADLE="./gradlew"
+          else
+            RUN_GRADLE="gradle"
+          fi
+
+          if [ "$PRIBADI" = "true" ]; then
+            $RUN_GRADLE assembleRelease --no-daemon -x lint -x test || $RUN_GRADLE assembleDebug --no-daemon -x lint -x test
+          else
+            $RUN_GRADLE assembleDebug --no-daemon -x lint -x test
+          fi
+
+      - name: Tandatangani APK dengan kunci pribadi
+        if: steps.tt.outputs.pribadi == 'true'
+        run: |
+          set -e
+          KS="$GITHUB_WORKSPACE/.tanda-tangan/kunci.p12"
+          PROP="$GITHUB_WORKSPACE/.tanda-tangan/sandi.properties"
+          export KS_ALIAS=$(grep '^alias=' "$PROP" | head -n 1 | cut -d= -f2- | tr -d '\r')
+          export KS_PASS=$(grep '^sandi=' "$PROP" | head -n 1 | cut -d= -f2- | tr -d '\r')
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          APKS=$(find . -path "*/build/outputs/apk/*" -name "*.apk" ! -name "*aligned*" ! -name "*idsig*")
+          test -n "$APKS" || { echo "Berkas APK tidak ditemukan!"; exit 1; }
+          for APK in $APKS; do
+            "$BT/zipalign" -p -f 4 "$APK" "$APK.aligned"
+            "$BT/apksigner" sign --ks "$KS" --ks-type PKCS12 --ks-key-alias "$KS_ALIAS" --ks-pass env:KS_PASS --key-pass env:KS_PASS --out "$APK" "$APK.aligned"
+            rm -f "$APK.aligned" "$APK.idsig"
+          done
+          FIRST=$(echo "$APKS" | head -n 1)
+          "$BT/apksigner" verify --print-certs "$FIRST"
+
+      - name: Siapkan berkas APK
+        env:
+          PRIBADI: ${{ steps.tt.outputs.pribadi }}
+        run: |
+          # Urutan dibuat tetap (sort) supaya varian yang dipilih selalu sama di setiap pembangunan.
+          APK_PATH=""
+          if [ "$PRIBADI" = "true" ]; then
+            APK_PATH=$(find . \( -path "*/build/outputs/apk/release/*" -o -path "*/build/outputs/apk/*/release/*" \) -name "*.apk" | sort | head -n 1)
+          fi
+          if [ -z "$APK_PATH" ]; then
+            APK_PATH=$(find . -path "*/build/outputs/apk/*" -name "*.apk" | sort | head -n 1)
+          fi
+          test -n "$APK_PATH" || { echo "Berkas APK tidak ditemukan!"; exit 1; }
+          cp "$APK_PATH" "jam-pintar-bro-v${{ github.run_number }}.apk"
+
+      - name: Simpan Artefak APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: APK-jam-pintar-bro-${{ github.run_number }}
+          path: "jam-pintar-bro-v${{ github.run_number }}.apk"
+
+      - name: Terbitkan ke GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Versi v${{ github.run_number }}
+          generate_release_notes: false
+          files: "jam-pintar-bro-v${{ github.run_number }}.apk"
